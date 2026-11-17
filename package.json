@@ -1,0 +1,38 @@
+{
+  "name": "@harness/dsh-plugin-handoff",
+  "version": "0.2.0",
+  "engines": {
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "private": true,
+  "description": "DSH 事项交接插件：会话事件上报（批次去重、本地暂存与七天到期）、首轮事项匹配与上下文注入",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "!lib/**/*.test.*",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

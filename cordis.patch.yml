@@ -1,0 +1,7 @@
+# 交接插件 bundle patch：依赖 harness-auth 写入的访问令牌（同一个 credentials 引用）。
+# 换平台地址时用 profile 级 patch 按 id 覆盖 harness-handoff 的 platformBaseUrl。
+- insert:
+    - id: harness-handoff
+      name: "@harness/dsh-plugin-handoff"
+      config:
+        platformBaseUrl: https://43-134-117-172.nip.io
