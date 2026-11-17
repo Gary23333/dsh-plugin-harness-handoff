@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { noteSession, persistenceProbe, purgeLocalSessions, type OwnershipProbe, type SessionPersistenceLike } from './local-retention.js'
+import { claimSession } from './session-owner.js'
 import { Uploader, eventPayload, type FetchLike } from './uploader.js'
 
 /**
@@ -13,13 +14,19 @@ import { Uploader, eventPayload, type FetchLike } from './uploader.js'
  *   命中则把接续摘要作为一条消息追加进本步输入。超时或失败时本次任务直接以用户输入继续。
  * - 注入消息的来源必须是生产方自有的 kind：DSH 0.2.x（会话格式 v4）拒绝 `kind: 'plugin'`。
  * - 本地留存：采集过的会话记入台账，从首次采集起满七天删除 DSH 本地日志与投影缓存（见 local-retention.ts）。
+ * - profile 隔离：同一 `DSH_HOME` 下不同 profile 共用 `sessions/` 与暂存目录；本插件只采集首次看到该会话的
+ *   profile 产生的事件，暂存按 profile 前缀隔离，避免 A 以自己身份上传 B 的会话（见 session-owner.ts）。
  *
  * 不依赖任何 DSH 包导入，类型只描述实际用到的最小子集。
  */
 
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.2.2'
 export const SOURCE_KIND = 'harness-handoff'
-const FIRST_TURN_WAIT_MS = 2000
+/**
+ * 首轮等待 /matters/resolve 的上限。服务端自身 1.7 秒内必返回，但跨境网络单次往返（含 TLS 建连）实测
+ * 1.8–4.2 秒（2026-11-17 新电脑排练），2 秒客户端上限会把已经匹配成功的结果丢掉。
+ */
+const FIRST_TURN_WAIT_MS = 5000
 const PURGE_INTERVAL_MS = 3600_000
 const PURGE_DELAY_MS = 60_000
 
@@ -55,6 +62,8 @@ export interface HandoffContext {
   on(event: 'session/event', listener: (session: { id?: string } | null, event: SessionEventLike) => void): unknown
   on(event: 'agent/pre-step', listener: (payload: PreStepPayload, next: () => Promise<Decision>) => Promise<Decision>): unknown
   logger?: { info?: (message: string) => void; warn?: (message: string) => void }
+  /** Cordis：读取启动器提供的 profile 信息（不需要声明 inject，读不到时回退）。 */
+  get?: (name: string) => unknown
   /** Cordis：服务可用时运行回调（这里用来拿 sessionPersistence 探测会话占用）。 */
   inject?: (deps: string[], callback: (ctx: { sessionPersistence?: SessionPersistenceLike }) => void) => unknown
 }
@@ -64,20 +73,50 @@ export interface HandoffConfig {
   platformBaseUrl?: string
   /** 访问令牌的凭证引用，与 harness-auth 的 apiKeyEnv 一致。 */
   apiKeyEnv?: string
-  /** 暂存目录，默认 $DSH_HOME/harness-team/handoff-spool。 */
+  /** 当前 DSH profile 名；缺省从 profileContext 读取，读不到时回退 default。 */
+  profile?: string
+  /** 暂存目录，默认 $DSH_HOME/harness-team/<profile>/handoff-spool。 */
   spoolDir?: string
   /** 首轮匹配是否启用，默认 true。 */
   inject?: boolean
   /** DSH 本地会话副本七天清理，默认 true。 */
   localRetention?: boolean
+  /** 首轮等待事项匹配的毫秒数，默认 5000（含网络往返；服务端自身 1.7 秒内返回）。 */
+  firstTurnWaitMs?: number
 }
 
 export interface HandoffDeps {
   fetch?: FetchLike
   dshVersion?: string
   now?: () => number
+  /** 覆盖 DSH_HOME（测试用）；缺省读环境变量或 ~/.dsh。 */
+  dshHome?: string
   /** 首次本地清理的最长等待（默认一分钟；第一轮对话结束会提前开始）。 */
   purgeDelayMs?: number
+}
+
+/** profile 名用于目录名：只保留安全字符，避免拼出任意路径。 */
+function profileSegment(profile: string): string {
+  const safe = profile.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80)
+  return safe || 'default'
+}
+
+/** profile 名优先取启动器上下文；再退回 launcher 写入的 user-agent 后缀。 */
+function resolveProfile(ctx: HandoffContext, config: HandoffConfig): string {
+  const configured = config.profile?.trim()
+  if (configured) return configured
+  const fromContext = (ctx.get?.('profileContext') as { name?: unknown } | undefined)?.name
+  if (typeof fromContext === 'string' && fromContext.trim()) return fromContext.trim()
+  const suffix = process.env.DSH_USER_AGENT_SUFFIX
+  if (suffix?.startsWith('dsh-profile/')) {
+    try {
+      const decoded = decodeURIComponent(suffix.slice('dsh-profile/'.length))
+      if (decoded) return decoded
+    } catch {
+      // 后缀被改动：按未知 profile 处理。
+    }
+  }
+  return 'default'
 }
 
 function textOf(messages: UserMessage[]): string {
@@ -102,11 +141,15 @@ export function applyHandoff(ctx: HandoffContext, config: HandoffConfig = {}, de
   const ref = (config.apiKeyEnv ?? 'HARNESS_PLATFORM_TOKEN') as CredentialRef
   const token = async () => (await ctx.credentials.resolve(ref).catch(() => undefined))?.value
   const doFetch: FetchLike = deps.fetch ?? (async (url, init) => fetch(url, init))
-  const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const dshHome = deps.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const profile = resolveProfile(ctx, config)
+  const profilePath = profileSegment(profile)
+  // 默认每个 profile 独立暂存目录；显式配置共用目录时，文件名仍带 profile 前缀，补报只处理自己的批次。
   const uploader = new Uploader({
     platformBaseUrl,
     token,
-    spoolDir: config.spoolDir ?? join(dshHome, 'harness-team', 'handoff-spool'),
+    spoolDir: config.spoolDir ?? join(dshHome, 'harness-team', profilePath, 'handoff-spool'),
+    spoolPrefix: profilePath,
     client: { plugin_version: PLUGIN_VERSION, dsh_version: deps.dshVersion ?? process.env.DSH_VERSION ?? 'unknown' },
     fetch: doFetch,
     log: say,
@@ -117,9 +160,36 @@ export function applyHandoff(ctx: HandoffContext, config: HandoffConfig = {}, de
   const seen = new Set<string>()
   let startPurge: () => void = () => undefined
   let currentSession: string | undefined
+
+  /**
+   * 会话归属：同一 DSH_HOME 下所有 profile 共用 sessions/，打开别人的会话也会触发 session/event。
+   * 首次看到会话的 profile 用独占标记认领；其他 profile 一律不采集、不注入、不记留存台账。
+   */
+  const ownership = new Map<string, boolean>()
+  const ownsSession = (id: string): boolean => {
+    const cached = ownership.get(id)
+    if (cached !== undefined) return cached
+    let ok = true
+    try {
+      const claim = claimSession({ dshHome, sessionId: id, profile, now: new Date(deps.now?.() ?? Date.now()) })
+      if (claim) {
+        ok = claim.owner === profile
+        if (!ok) {
+          ctx.logger?.warn?.(`[harness-handoff] 会话 ${id} 属于 profile ${claim.owner}，本 profile（${profile}）不采集、不上报`)
+        }
+      }
+    } catch (error) {
+      // 归属标记写不了：不阻断当前会话，服务端还有跨成员归属校验兜底。
+      ctx.logger?.warn?.(`[harness-handoff] 会话归属标记失败：${(error as Error).message}`)
+    }
+    ownership.set(id, ok)
+    return ok
+  }
+
   ctx.on('session/event', (session, event) => {
     const id = session?.id
     if (!id || typeof event.seq !== 'number' || !event.type) return
+    if (!ownsSession(id)) return
     currentSession = id
     if (retention && !seen.has(id)) {
       seen.add(id)
@@ -142,6 +212,8 @@ export function applyHandoff(ctx: HandoffContext, config: HandoffConfig = {}, de
       const sessionId = (payload.agent as { session?: { id?: string } } | undefined)?.session?.id ?? currentSession
       // 每个会话在本进程只做一次首轮匹配（续接的新进程会再做一次）。
       if (!sessionId || injected.has(sessionId)) return decision
+      // 不是本 profile 创建的会话：不注入接续内容，避免把别人的事项带进当前会话。
+      if (!ownsSession(sessionId)) return decision
       injected.add(sessionId)
       const input = textOf(payload.messages)
       const accessToken = await token()
@@ -151,7 +223,7 @@ export function applyHandoff(ctx: HandoffContext, config: HandoffConfig = {}, de
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${accessToken}` },
           body: JSON.stringify({ session_id: sessionId, input_text: input }),
-          signal: AbortSignal.any([payload.signal, AbortSignal.timeout(FIRST_TURN_WAIT_MS)]),
+          signal: AbortSignal.any([payload.signal, AbortSignal.timeout(config.firstTurnWaitMs ?? FIRST_TURN_WAIT_MS)]),
         })
         if (response.status !== 200) return decision
         const body = (await response.json()) as { outcome?: string; context?: { text?: string } | null }
@@ -228,3 +300,4 @@ export default {
 
 export { Uploader, toBatches, eventPayload } from './uploader.js'
 export { purgeLocalSessions, noteSession, readLedger, localCopies } from './local-retention.js'
+export { claimSession, readSessionOwner, sessionOwnerDir, sessionOwnerPath, clearSessionOwner } from './session-owner.js'

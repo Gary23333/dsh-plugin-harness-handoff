@@ -4,6 +4,8 @@
  * - 按会话缓冲已提交事件，回合结束（turn/end）或缓冲满时上报；序号出现缺口（DSH 续接时会跳号）就拆成多个批次，
  *   每个批次序号连续，与平台契约一致。
  * - 上报失败的批次写入本地暂存目录（文件权限 0600），下次运行先补报；采集超过七天的批次停止上报并删除。
+ * - 同一 `DSH_HOME` 下多个 profile 可能共用一个暂存目录：文件名带 profile 前缀，补报只处理本 profile 的批次，
+ *   避免 A 把 B 设备/成员产生的批次以自己的令牌上传（2026-11-17 排练实测）。
  * - 平台按 `device + session + end_seq` 去重，重复补报安全。
  * - 只上报对摘要有用的内容：系统提示词、请求头等大块内容只保留类型与序号。
  */
@@ -41,6 +43,8 @@ export interface UploaderOptions {
     platformBaseUrl: string;
     token: () => Promise<string | undefined>;
     spoolDir: string;
+    /** 暂存文件名前缀（通常是 DSH profile）；多个 profile 共用一个目录时只补报自己的批次。 */
+    spoolPrefix?: string;
     client: Batch['client'];
     fetch: FetchLike;
     log?: (message: string) => void;
@@ -57,8 +61,10 @@ export declare class Uploader {
      * 同一进程内串行上传，保证序号顺序。
      */
     flush(sessionId?: string): Promise<void>;
-    /** 补报暂存目录里的批次；超过七天的直接删除。 */
+    /** 补报暂存目录里本 profile 的批次；超过七天的（含其他 profile/旧版本留下的）直接删除。 */
     drainSpool(): Promise<void>;
+    /** 不属于本 profile 的批次：超过七天按留存删除，未满七天留给对应进程或人工处理。 */
+    private expireAbandoned;
     private expired;
     private spool;
     private send;

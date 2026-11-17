@@ -70,10 +70,54 @@ describe('上报与暂存', () => {
     expect(readdirSync(spoolDir)).toHaveLength(0)
     expect(f.calls).toHaveLength(1) // 只有第一次失败的那次
   })
+
+  it('多 profile 共用暂存目录：只补报自己的批次，其他 profile 的批次不动', async () => {
+    const spoolDir = mkdtempSync(join(tmpdir(), 'handoff-'))
+    const failed = fakeFetch(503)
+    const a = new Uploader({ platformBaseUrl: 'http://p', token: async () => 'ta', spoolDir, spoolPrefix: 'harness-a', client, fetch: failed.fn })
+    a.record('s-a', ev(0, 'turn/end'))
+    await a.flush()
+    expect(readdirSync(spoolDir)).toHaveLength(1)
+    expect(readdirSync(spoolDir)[0]!.startsWith('harness-a--')).toBe(true)
+
+    const ok = fakeFetch(201)
+    const b = new Uploader({ platformBaseUrl: 'http://p', token: async () => 'tb', spoolDir, spoolPrefix: 'harness-b', client, fetch: ok.fn })
+    await b.drainSpool()
+    expect(ok.calls).toHaveLength(0)
+    expect(readdirSync(spoolDir)).toHaveLength(1)
+
+    const a2 = new Uploader({ platformBaseUrl: 'http://p', token: async () => 'ta', spoolDir, spoolPrefix: 'harness-a', client, fetch: ok.fn })
+    await a2.drainSpool()
+    expect(ok.calls).toHaveLength(1)
+    expect(readdirSync(spoolDir)).toHaveLength(0)
+  })
+
+  it('共用暂存目录里其他 profile 的过期批次按七天留存删除', async () => {
+    const spoolDir = mkdtempSync(join(tmpdir(), 'handoff-'))
+    const stale = fakeFetch(503)
+    const a = new Uploader({ platformBaseUrl: 'http://p', token: async () => 'ta', spoolDir, spoolPrefix: 'harness-a', client, fetch: stale.fn })
+    a.record('s-a', ev(0, 'turn/end'))
+    await a.flush()
+    expect(readdirSync(spoolDir)).toHaveLength(1)
+
+    const never = fakeFetch(201)
+    const b = new Uploader({
+      platformBaseUrl: 'http://p',
+      token: async () => 'tb',
+      spoolDir,
+      spoolPrefix: 'harness-b',
+      client,
+      fetch: never.fn,
+      now: () => Date.now() + RETENTION_MS + 1,
+    })
+    await b.drainSpool()
+    expect(never.calls).toHaveLength(0)
+    expect(readdirSync(spoolDir)).toHaveLength(0)
+  })
 })
 
 describe('首轮注入', () => {
-  function harness(fetchImpl: FetchLike) {
+  function harness(fetchImpl: FetchLike, extra: { firstTurnWaitMs?: number } = {}) {
     const listeners: Record<string, (...args: any[]) => any> = {}
     const ctx = {
       credentials: { resolve: async () => ({ value: 'tok' }) },
@@ -81,7 +125,7 @@ describe('首轮注入', () => {
         listeners[name] = fn
       },
     }
-    applyHandoff(ctx as never, { platformBaseUrl: 'http://p', spoolDir: mkdtempSync(join(tmpdir(), 'h-')), localRetention: false }, { fetch: fetchImpl })
+    applyHandoff(ctx as never, { platformBaseUrl: 'http://p', spoolDir: mkdtempSync(join(tmpdir(), 'h-')), localRetention: false, ...extra }, { fetch: fetchImpl })
     return listeners
   }
   const payload = () => ({
@@ -104,11 +148,15 @@ describe('首轮注入', () => {
   })
 
   it('平台超时或失败时照常进入，不阻塞任务', async () => {
-    const l = harness(async (_u, init) => new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('timeout')))))
+    // 默认上限 5 秒（跨境往返实测可达 4 秒）；这里配置成 300 毫秒验证超时后照常进入。
+    const l = harness(
+      async (_u, init) => new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('timeout')))),
+      { firstTurnWaitMs: 300 },
+    )
     const started = Date.now()
     const d = await l['agent/pre-step']!(payload(), next)
     expect(d.messages).toHaveLength(1)
-    expect(Date.now() - started).toBeLessThan(3000)
+    expect(Date.now() - started).toBeLessThan(1500)
   })
 })
 
@@ -116,4 +164,45 @@ it('暂存目录不存在时补报为空操作', async () => {
   const up = new Uploader({ platformBaseUrl: 'http://p', token: async () => 't', spoolDir: join(tmpdir(), 'nope-handoff-xyz'), client, fetch: fakeFetch(201).fn })
   await up.drainSpool()
   expect(existsSync(join(tmpdir(), 'nope-handoff-xyz'))).toBe(false)
+})
+
+describe('同机多 profile 不串会话', () => {
+  const sid = 'session-33333333-aaaa-4bbb-8ccc-dddddddddddd'
+
+  function profile(name: string, home: string) {
+    const listeners: Record<string, (...args: any[]) => any> = {}
+    const f = fakeFetch(201)
+    const uploader = applyHandoff(
+      {
+        credentials: { resolve: async () => ({ value: 'tok' }) },
+        on: (event: string, listener: (...args: any[]) => any) => {
+          listeners[event] = listener
+        },
+        get: (service: string) => (service === 'profileContext' ? { name } : undefined),
+      } as never,
+      { platformBaseUrl: 'http://p', spoolDir: join(home, name), localRetention: false, inject: false },
+      { dshHome: home, fetch: f.fn },
+    )!
+    return { listeners, fetch: f, uploader }
+  }
+
+  it('B 创建的会话只由 B 上报；A 在同一 DSH_HOME 打开也不会上传', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'handoff-profiles-'))
+    const a = profile('harness-a', home)
+    const b = profile('harness-b', home)
+    // 启动补报与事件上报共用一条串行链；先让启动补报跑完，避免同一批次被补报一次（平台按区间去重，不会重复入库）。
+    await a.uploader.drainSpool()
+    await b.uploader.drainSpool()
+
+    b.listeners['session/event']!({ id: sid }, { seq: 0, type: 'user/message', data: {} })
+    b.listeners['session/event']!({ id: sid }, { seq: 1, type: 'turn/end', data: {} })
+    await b.uploader.flush()
+    expect(b.fetch.calls).toHaveLength(1)
+    expect(a.fetch.calls).toHaveLength(0)
+
+    a.listeners['session/event']!({ id: sid }, { seq: 2, type: 'user/message', data: {} })
+    a.listeners['session/event']!({ id: sid }, { seq: 3, type: 'turn/end', data: {} })
+    await a.uploader.flush()
+    expect(a.fetch.calls).toHaveLength(0)
+  })
 })
