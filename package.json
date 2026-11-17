@@ -1,6 +1,6 @@
 {
   "name": "@harness/dsh-plugin-handoff",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "engines": {
     "dsh": ">=0.2.2-rc.1"
   },

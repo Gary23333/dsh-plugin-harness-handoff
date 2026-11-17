@@ -1,11 +1,11 @@
-import { existsSync, mkdtempSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
 import { applyHandoff, SOURCE_KIND } from './index.js'
-import { RETENTION_MS, Uploader, toBatches, type Batch, type FetchLike } from './uploader.js'
+import { RETENTION_MS, Uploader, purgeExpiredSpool, toBatches, type Batch, type FetchLike } from './uploader.js'
 
 const client = { plugin_version: '0.1.0', dsh_version: '0.2.2-rc.3' }
 const at = new Date().toISOString()
@@ -90,6 +90,20 @@ describe('上报与暂存', () => {
     await a2.drainSpool()
     expect(ok.calls).toHaveLength(1)
     expect(readdirSync(spoolDir)).toHaveLength(0)
+  })
+
+  it('旧版共享暂存目录只删除满七天的批次，未满七天的保留', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'handoff-legacy-'))
+    const old = join(dir, 'old.json')
+    const fresh = join(dir, 'fresh.json')
+    writeFileSync(old, '{}')
+    writeFileSync(fresh, '{}')
+    const now = Date.now()
+    utimesSync(old, new Date(now - RETENTION_MS - 1), new Date(now - RETENTION_MS - 1))
+    utimesSync(fresh, new Date(now - 1000), new Date(now - 1000))
+    expect(purgeExpiredSpool(dir, now)).toBe(1)
+    expect(existsSync(old)).toBe(false)
+    expect(existsSync(fresh)).toBe(true)
   })
 
   it('共用暂存目录里其他 profile 的过期批次按七天留存删除', async () => {

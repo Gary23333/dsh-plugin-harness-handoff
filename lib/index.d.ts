@@ -13,7 +13,7 @@ import { Uploader, type FetchLike } from './uploader.js';
  *
  * 不依赖任何 DSH 包导入，类型只描述实际用到的最小子集。
  */
-export declare const PLUGIN_VERSION = "0.2.2";
+export declare const PLUGIN_VERSION = "0.2.3";
 export declare const SOURCE_KIND = "harness-handoff";
 type CredentialRef = string & {
     readonly __brand?: 'CredentialRef';

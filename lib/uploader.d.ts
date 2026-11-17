@@ -39,6 +39,12 @@ export type FetchLike = (url: string, init: {
 export declare const RETENTION_MS: number;
 export declare function eventPayload(type: string, data: unknown): Record<string, unknown>;
 export declare function toBatches(sessionId: string, events: ProbeEvent[], client: Batch['client']): Batch[];
+/**
+ * 清理旧版（0.2.1 及以前）共享暂存目录里满七天的批次。
+ * 0.2.2 起默认使用按 profile 分开的目录，旧目录不再被补报；里面的内容按七天留存删除，
+ * 未满七天的保留，避免升级瞬间误删仍可能被旧进程补报的批次。
+ */
+export declare function purgeExpiredSpool(dir: string, now?: number): number;
 export interface UploaderOptions {
     platformBaseUrl: string;
     token: () => Promise<string | undefined>;
