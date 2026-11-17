@@ -9,6 +9,8 @@ DSH 事项交接插件（二期 P2-03、P2-05、P2-08 客户端部分，DSH 0.2.
   （`--without-handoff` 只装认证插件）。
 - **DSH 插件页 / CLI**：先装认证插件，再粘贴本插件仓库地址，或
   `dsh plugin --profile <profile> add github:Gary23333/dsh-plugin-harness-handoff`。
+  pnpm 11 会拦截 git 托管插件的构建脚本：插件页会提示"允许并重试"；命令行安装需按提示把
+  `allowBuilds` 键写入 profile 的 `pnpm-workspace.yaml` 后重试，或直接使用安装器。
 
 ## 做什么
 
